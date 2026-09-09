@@ -38,7 +38,7 @@ def handle_message(event):
     prompt = f"你是一個專業的韓語翻譯與教學助手。請將使用者發送的文字翻譯成韓文，並附上常用口語形式（-요 形）與簡短說明（說明請使用純文字段落格式，切勿使用表格）。文字如下：\n{user_text}"
     
     response = claude_client.messages.create(
-        model="claude-sonnet-4-6t",
+        model="claude-sonnet-4-6",
         max_tokens=1000,
         messages=[{"role": "user", "content": prompt}]
     )
