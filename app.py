@@ -46,7 +46,6 @@ IMAGE_PROMPT = (
 def index():
     return "LINE Korean Translator Bot is Running!"
 
-
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers.get('X-Line-Signature', '')
