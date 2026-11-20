@@ -64,13 +64,21 @@ CORRECTION_SYSTEM = (
 )
 
 IMAGE_PROMPT = (
-    "你是一個專業的韓語翻譯與教學助手。請閱讀這張圖片中出現的所有韓文文字"
-    "（例如招牌、菜單、標籤、對話截圖等），並：\n"
+    "你是一個專業的韓語翻譯與教學助手，使用者是以中文為母語、正在學韓文的人。"
+    "請先判斷這張圖片屬於下列哪一種情況，再依規則回覆：\n\n"
+    "【情況一：圖片中有韓文文字】（招牌、菜單、標籤、對話截圖等）\n"
     "1. 先列出你辨識到的原始韓文文字\n"
     "2. 提供繁體中文翻譯\n"
-    "3. 附上常用口語形式（-요 形）與簡短說明\n"
-    "格式要求：使用純文字段落，切勿使用表格，也不要使用 Markdown 符號（例如 ** 或 #）。"
-    "如果圖片中沒有韓文文字，請告知使用者。"
+    "3. 列出重點單字（韓文與中文意思），並附上常用口語形式（-요 形）與簡短說明\n\n"
+    "【情況二：圖片中有中文或其他語言的文字】（中文菜單、告示、對話截圖等）\n"
+    "1. 先列出辨識到的原文\n"
+    "2. 翻譯成自然的韓文，並在每句後面附上繁體中文意思\n\n"
+    "【情況三：圖片中沒有文字，是照片】（食物、風景、物品、人物活動等）\n"
+    "不要說「無法翻譯」，而是用韓文描述這張圖片，請依序提供：\n"
+    "1. 用 1 到 3 句簡單的韓文描述圖片內容（適合 TOPIK 初中級學習者），每句後面附上繁體中文意思\n"
+    "2. 圖片中主要物品的韓文單字（例如食物的韓文名稱），格式為「韓文：中文」\n\n"
+    "格式要求：使用繁體中文與純文字段落，切勿使用表格，也不要使用 Markdown 符號（例如 ** 或 #）。"
+    "韓文內容只寫韓文字，不要加羅馬拼音。"
 )
 
 
@@ -201,6 +209,9 @@ def handle_text_message(event):
 
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image_message(event):
+    user_id = event.source.user_id
+    history = get_history(user_id)
+    result = None
     try:
         # 從 LINE 下載使用者傳來的圖片內容
         message_content = line_bot_api.get_message_content(event.message.id)
@@ -233,7 +244,13 @@ def handle_image_message(event):
         app.logger.error("Image handling error: %s", e)
         result = None
 
-    reply(event, result or ERROR_REPLY)
+    if result is None:
+        reply(event, ERROR_REPLY)
+        return
+
+    # 把這次圖片翻譯存進對話記憶，之後可以接著追問（例如「這個單字是什麼意思」）
+    save_history(user_id, history, "（使用者傳了一張圖片請你翻譯）", result)
+    reply(event, result)
 
 
 if __name__ == "__main__":
