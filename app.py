@@ -28,6 +28,11 @@ SMART_MODEL = "claude-sonnet-4-6"
 
 ERROR_REPLY = "抱歉，翻譯暫時出錯了，請稍後再試一次。"
 
+# ---------- 長文設定 ----------
+MAX_OUTPUT_TOKENS = 4000        # 長文章翻譯需要足夠的輸出長度，原本 1000 會寫到一半被截斷
+LINE_CHUNK_CHARS = 4500         # LINE 單則文字上限 5000 字，保守切在 4500
+LINE_MAX_MESSAGES = 5           # LINE 一次 reply 最多 5 則訊息
+
 # ---------- 對話記憶設定 ----------
 MAX_HISTORY_MESSAGES = 6        # 最多記住最近 3 輪（使用者 + bot 各算 1 則）
 HISTORY_TTL_SECONDS = 30 * 60   # 超過 30 分鐘沒講話，就當成新對話
@@ -47,6 +52,8 @@ TRANSLATE_SYSTEM = (
     "每一種韓文後面都用一兩句話說明適用場合。\n\n"
     "【如果是韓文句子】請翻譯成繁體中文，列出句子中的重點單字（韓文與中文意思），"
     "並簡短說明用到的文法。\n\n"
+    "【如果是很長的文章（多個段落）】請依原文段落順序完整翻譯每一段，不可省略或只翻前面；"
+    "重點單字只挑最重要的 8 到 10 個，文法說明精簡成 3 點以內，確保全文翻譯一定寫完。\n\n"
     "【如果是接續上一則的追問】例如「改成半語」「再正式一點」「這個單字是什麼意思」，"
     "請根據前面的對話內容直接回答追問，不需要重新列出三種形式。\n\n"
     "格式要求：使用繁體中文與純文字段落，切勿使用表格，也不要使用 Markdown 符號（例如 ** 或 #）。"
@@ -101,11 +108,14 @@ def callback():
 def ask_claude(model, messages, system=None):
     """呼叫 Claude。成功回傳文字，失敗回傳 None（由呼叫端決定怎麼回覆）。"""
     try:
-        kwargs = {"model": model, "max_tokens": 1000, "messages": messages}
+        kwargs = {"model": model, "max_tokens": MAX_OUTPUT_TOKENS, "messages": messages}
         if system:
             kwargs["system"] = system
         response = claude_client.messages.create(**kwargs)
-        return response.content[0].text
+        text = response.content[0].text
+        if response.stop_reason == "max_tokens":
+            text += "\n\n（內容太長，後半段被截斷了。可以把文章分成幾段再傳。）"
+        return text
     except Exception as e:
         app.logger.error("Claude API error: %s", e)
         return None
@@ -159,11 +169,41 @@ def detect_media_type(data):
     return "image/jpeg"
 
 
+def split_text(text, limit=LINE_CHUNK_CHARS):
+    """把長文字依段落切成多則，每則不超過 limit 字。"""
+    chunks, current = [], ""
+    for para in text.split("\n"):
+        # 單一段落本身就超過上限時，硬切
+        while len(para) > limit:
+            if current:
+                chunks.append(current.rstrip("\n"))
+                current = ""
+            chunks.append(para[:limit])
+            para = para[limit:]
+        if len(current) + len(para) + 1 > limit:
+            chunks.append(current.rstrip("\n"))
+            current = ""
+        current += para + "\n"
+    if current.strip():
+        chunks.append(current.rstrip("\n"))
+    return chunks or [""]
+
+
 def reply(event, text):
-    # LINE 單則文字上限 5000 字
-    line_bot_api.reply_message(
-        event.reply_token, TextSendMessage(text=text[:4900])
-    )
+    chunks = split_text(text)
+    if len(chunks) > LINE_MAX_MESSAGES:
+        chunks = chunks[:LINE_MAX_MESSAGES]
+        chunks[-1] = chunks[-1][:LINE_CHUNK_CHARS - 30] + "\n\n（內容過長，已截斷）"
+    messages = [TextSendMessage(text=c) for c in chunks]
+    try:
+        line_bot_api.reply_message(event.reply_token, messages)
+    except Exception as e:
+        # reply token 逾時（長文生成較久）時，改用 push 補送
+        app.logger.error("reply_message failed, fallback to push: %s", e)
+        try:
+            line_bot_api.push_message(event.source.user_id, messages)
+        except Exception as e2:
+            app.logger.error("push_message failed: %s", e2)
 
 
 @handler.add(MessageEvent, message=TextMessage)
