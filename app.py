@@ -189,21 +189,80 @@ def split_text(text, limit=LINE_CHUNK_CHARS):
     return chunks or [""]
 
 
-def reply(event, text):
+def build_messages(text):
     chunks = split_text(text)
     if len(chunks) > LINE_MAX_MESSAGES:
         chunks = chunks[:LINE_MAX_MESSAGES]
         chunks[-1] = chunks[-1][:LINE_CHUNK_CHARS - 30] + "\n\n（內容過長，已截斷）"
-    messages = [TextSendMessage(text=c) for c in chunks]
+    return [TextSendMessage(text=c) for c in chunks]
+
+
+def reply(event, text):
+    messages = build_messages(text)
     try:
         line_bot_api.reply_message(event.reply_token, messages)
     except Exception as e:
-        # reply token 逾時（長文生成較久）時，改用 push 補送
+        # reply token 逾時時，改用 push 補送
         app.logger.error("reply_message failed, fallback to push: %s", e)
-        try:
-            line_bot_api.push_message(event.source.user_id, messages)
-        except Exception as e2:
-            app.logger.error("push_message failed: %s", e2)
+        push(event.source.user_id, text)
+
+
+def push(user_id, text):
+    try:
+        line_bot_api.push_message(user_id, build_messages(text))
+    except Exception as e:
+        app.logger.error("push_message failed: %s", e)
+
+
+LONG_TEXT_CHARS = 150  # 超過這個字數的文字，改走「先回收到、背景翻譯後推送」
+
+
+def ack(event, text):
+    """先用 reply token 秒回一則簡短訊息，避免長文生成太久導致憑證逾時。"""
+    try:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text))
+    except Exception as e:
+        app.logger.error("ack failed: %s", e)
+
+
+def run_in_background(fn, *args):
+    t = threading.Thread(target=fn, args=args, daemon=True)
+    t.start()
+
+
+def translate_text(user_id, user_text):
+    """做完整的文字翻譯／糾錯流程，回傳要傳給使用者的文字。"""
+    history = get_history(user_id)
+
+    # 糾錯模式：「改：我是學生이에요」
+    correction = parse_correction(user_text)
+    if correction is not None:
+        if not correction:
+            return "請在「改：」後面貼上你寫的韓文，例如：\n改：저는 어제 학교에 갔어요"
+        stored_text = "（請幫我校正這句韓文）" + correction
+        system = CORRECTION_SYSTEM
+    else:
+        stored_text = user_text
+        system = TRANSLATE_SYSTEM
+
+    result = ask_claude(
+        SMART_MODEL,
+        history + [{"role": "user", "content": stored_text}],
+        system=system,
+    )
+    if result is None:
+        return ERROR_REPLY
+    save_history(user_id, history, stored_text, result)
+    return result
+
+
+def translate_text_async(user_id, user_text):
+    try:
+        result = translate_text(user_id, user_text)
+    except Exception as e:
+        app.logger.error("Async text error: %s", e)
+        result = ERROR_REPLY
+    push(user_id, result)
 
 
 @handler.add(MessageEvent, message=TextMessage)
@@ -217,44 +276,20 @@ def handle_text_message(event):
         reply(event, "已清除對話記憶，可以開始新的話題。")
         return
 
-    history = get_history(user_id)
-
-    # 糾錯模式：「改：我是學生이에요」
-    correction = parse_correction(user_text)
-    if correction is not None:
-        if not correction:
-            reply(event, "請在「改：」後面貼上你寫的韓文，例如：\n改：저는 어제 학교에 갔어요")
-            return
-        stored_text = "（請幫我校正這句韓文）" + correction
-        result = ask_claude(
-            SMART_MODEL,
-            history + [{"role": "user", "content": stored_text}],
-            system=CORRECTION_SYSTEM,
-        )
-    else:
-        stored_text = user_text
-        result = ask_claude(
-            SMART_MODEL,
-            history + [{"role": "user", "content": stored_text}],
-            system=TRANSLATE_SYSTEM,
-        )
-
-    if result is None:
-        reply(event, ERROR_REPLY)
+    # 長文：先回收到，背景翻譯完再推送
+    if len(user_text) > LONG_TEXT_CHARS:
+        ack(event, "收到～長文翻譯中，大約需要 1 分鐘，請稍等…")
+        run_in_background(translate_text_async, user_id, user_text)
         return
 
-    save_history(user_id, history, stored_text, result)
-    reply(event, result)
+    reply(event, translate_text(user_id, user_text))
 
 
-@handler.add(MessageEvent, message=ImageMessage)
-def handle_image_message(event):
-    user_id = event.source.user_id
+def translate_image(user_id, message_id):
     history = get_history(user_id)
-    result = None
     try:
         # 從 LINE 下載使用者傳來的圖片內容
-        message_content = line_bot_api.get_message_content(event.message.id)
+        message_content = line_bot_api.get_message_content(message_id)
         image_bytes = BytesIO()
         for chunk in message_content.iter_content():
             image_bytes.write(chunk)
@@ -285,12 +320,27 @@ def handle_image_message(event):
         result = None
 
     if result is None:
-        reply(event, ERROR_REPLY)
-        return
+        return ERROR_REPLY
 
     # 把這次圖片翻譯存進對話記憶，之後可以接著追問（例如「這個單字是什麼意思」）
     save_history(user_id, history, "（使用者傳了一張圖片請你翻譯）", result)
-    reply(event, result)
+    return result
+
+
+def translate_image_async(user_id, message_id):
+    try:
+        result = translate_image(user_id, message_id)
+    except Exception as e:
+        app.logger.error("Async image error: %s", e)
+        result = ERROR_REPLY
+    push(user_id, result)
+
+
+@handler.add(MessageEvent, message=ImageMessage)
+def handle_image_message(event):
+    # 圖片常常是長文，一律先回收到，背景處理完再推送
+    ack(event, "收到圖片～翻譯中，長文大約需要 1 分鐘，請稍等…")
+    run_in_background(translate_image_async, event.source.user_id, event.message.id)
 
 
 if __name__ == "__main__":
